@@ -1,712 +1,784 @@
-%% Classical Car Plate Extractor
-% Finds the most likely license plate region first, then runs OCR only on
-% that candidate to avoid scanning road, sky, and other background areas.
+function BK
+%BK Scrollable MATLAB frontend for vehicle plate extraction.
 
-clear;
-clc;
-close all;
-
-imagePath = 'C:\APU\Matlab\Assignment\DataSet\images\2024-JPJ-ePlate-EV-Number-Plate-11.jpg';
-img = loadVehicleImage(imagePath);
-
-[plateText, plateBox, plateImage, binaryPlate, candidateBoxes] = extractCarPlate(img);
-
-figure('Name', 'Detected Plate');
-imshow(img);
-hold on;
-
-if ~isempty(plateBox)
-    rectangle('Position', plateBox, 'EdgeColor', 'g', 'LineWidth', 2);
-    if strlength(plateText) > 0
-        text(plateBox(1), max(plateBox(2) - 10, 10), char(plateText), ...
-            'Color', 'yellow', 'FontSize', 13, 'FontWeight', 'bold', ...
-            'BackgroundColor', 'black', 'Margin', 2);
-        title(['Detected Plate: ' char(plateText)]);
-    else
-        title('Detected Plate Candidate');
-    end
-else
-    title('No reliable plate candidate found');
-
-    for n = 1:size(candidateBoxes, 1)
-        rectangle('Position', candidateBoxes(n, :), 'EdgeColor', 'y', 'LineWidth', 1);
-    end
-end
-
-hold off;
-
-if ~isempty(plateImage)
-    figure('Name', 'Plate Crop');
-    imshow(plateImage);
-    title('Best Plate Candidate');
-end
-
-if ~isempty(binaryPlate)
-    figure('Name', 'OCR Input');
-    imshow(binaryPlate);
-    title('Binary Plate For OCR');
-end
-
-disp('==== Detected Plate Text ====');
-disp(plateText);
-
-if ~isempty(binaryPlate)
-    imwrite(binaryPlate, 'C:\APU\Matlab\Assignment\DataSet\images\OCR_ready_plate.png');
-end
-
-function [plateText, bestBox, bestCrop, bestBinary, candidateBoxes] = extractCarPlate(imageData)
-    grayImage = preprocessVehicleImage(imageData);
-    [rows, cols] = size(grayImage);
-
-    % Restrict the search to the central/lower part of the vehicle scene.
-    % Rear plates are usually near the horizontal center and below mid-height.
-    rowStart = max(1, round(rows * 0.35));
-    rowEnd = min(rows, round(rows * 0.92));
-    colStart = max(1, round(cols * 0.20));
-    colEnd = min(cols, round(cols * 0.80));
-
-    searchMask = false(rows, cols);
-    searchMask(rowStart:rowEnd, colStart:colEnd) = true;
-
-    edgeImage = edge(grayImage, 'Canny');
-    edgeImage = edgeImage & searchMask;
-
-    horizontalSE = strel('rectangle', [4 18]);
-    candidateMask = imclose(edgeImage, horizontalSE);
-    candidateMask = imfill(candidateMask, 'holes');
-    candidateMask = bwareaopen(candidateMask, 150);
-
-    stats = regionprops(candidateMask, 'BoundingBox', 'Area', ...
-        'Extent', 'Solidity', 'Eccentricity', 'Centroid');
-
-    % Fallback for dark license plates with bright text, common in night
-    % scenes where edge-only detection can miss the plate body.
-    darkMask = grayImage < 85;
-    darkMask = darkMask & searchMask;
-    darkMask = imclose(darkMask, strel('rectangle', [5 21]));
-    darkMask = imopen(darkMask, strel('rectangle', [3 9]));
-    darkMask = imfill(darkMask, 'holes');
-    darkMask = bwareaopen(darkMask, 250);
-
-    darkStats = regionprops(darkMask, 'BoundingBox', 'Area', ...
-        'Extent', 'Solidity', 'Eccentricity', 'Centroid');
-    stats = [stats; darkStats];
-
-    % Additional path for bright rectangular plates with dark text.
-    brightMask = grayImage > 150;
-    brightMask = brightMask & searchMask;
-    brightMask = imclose(brightMask, strel('rectangle', [5 17]));
-    brightMask = imopen(brightMask, strel('rectangle', [3 7]));
-    brightMask = imfill(brightMask, 'holes');
-    brightMask = bwareaopen(brightMask, 250);
-
-    brightStats = regionprops(brightMask, 'BoundingBox', 'Area', ...
-        'Extent', 'Solidity', 'Eccentricity', 'Centroid');
-    stats = [stats; brightStats];
-
-    bestScore = -inf;
-    bestBox = [];
-    bestCrop = [];
-    bestBinary = [];
-    candidateBoxes = [];
-    plateText = "";
-
-    for i = 1:numel(stats)
-        bbox = stats(i).BoundingBox;
-        aspectRatio = bbox(3) / bbox(4);
-        boxArea = bbox(3) * bbox(4);
-        relativeArea = boxArea / (rows * cols);
-        centerX = stats(i).Centroid(1) / cols;
-        centerY = stats(i).Centroid(2) / rows;
-        distanceFromCenter = abs(centerX - 0.5);
-
-        % Plate-like geometry filters.
-        if aspectRatio < 0.8 || aspectRatio > 8.5
-            continue;
-        end
-
-        if relativeArea < 0.0015 || relativeArea > 0.20
-            continue;
-        end
-
-        if stats(i).Extent < 0.20 || stats(i).Solidity < 0.20
-            continue;
-        end
-
-        if centerY < 0.35 || centerY > 0.92
-            continue;
-        end
-
-        if centerX < 0.12 || centerX > 0.88
-            continue;
-        end
-
-        expandedBox = expandBoundingBox(bbox, rows, cols, 0.08, 0.18);
-        refinedBox = refinePlateBox(grayImage, expandedBox);
-        candidateBoxes = [candidateBoxes; refinedBox];
-        plateCrop = imcrop(grayImage, refinedBox);
-        [focusedPlate, textRegion, enhancedPlate, binaryPlate, charCount] = preparePlateForOCR(plateCrop);
-
-        if charCount < 1 || charCount > 12
-            continue;
-        end
-
-        [recognizedText, textConfidence] = runPlateOCR(focusedPlate, textRegion, enhancedPlate, binaryPlate);
-
-        if strlength(recognizedText) == 0
-            recognizedText = segmentPlateText(binaryPlate);
-            textConfidence = NaN;
-        end
-
-        if strlength(recognizedText) == 0
-            recognizedText = readPlateByLines(focusedPlate, textRegion, enhancedPlate, binaryPlate);
-            textConfidence = NaN;
-        end
-
-        score = charCount * 8 + stats(i).Extent * 20 + stats(i).Solidity * 15;
-
-        if ~isnan(textConfidence)
-            score = score + textConfidence / 5;
-        end
-
-        if strlength(recognizedText) >= 2 && strlength(recognizedText) <= 12
-            score = score + 20;
-        end
-
-        % Rear plate prior: reward candidates near image center and lower-middle.
-        score = score - distanceFromCenter * 120;
-        score = score - abs(centerY - 0.60) * 70;
-
-        % Penalize top-side background text and oversized background regions.
-        if refinedBox(2) < rows * 0.35
-            score = score - 35;
-        end
-
-        if refinedBox(3) > cols * 0.35 || refinedBox(4) > rows * 0.18
-            score = score - 40;
-        end
-
-        if strlength(recognizedText) == 0
-            score = score - 15;
-        end
-
-        if score > bestScore
-            bestScore = score;
-            bestBox = refinedBox;
-            bestCrop = textRegion;
-            bestBinary = binaryPlate;
-            plateText = recognizedText;
-        end
-    end
-end
-
-function preprocessedImage = preprocessVehicleImage(imageData)
-    if ndims(imageData) == 3
-        grayImage = rgb2gray(imageData);
-    else
-        grayImage = imageData;
+    appFolder = fileparts(mfilename('fullpath'));
+    if ~contains(path, appFolder)
+        addpath(appFolder);
     end
 
-    grayImage = im2uint8(grayImage);
-    grayImage = adapthisteq(grayImage, 'NumTiles', [8 8], 'ClipLimit', 0.015);
-    preprocessedImage = medfilt2(grayImage, [3 3]);
+    buildFrontend();
 end
 
-function [focusedPlate, textRegion, enhancedPlate, bestBinary, charCount] = preparePlateForOCR(plateCrop)
-    plateCrop = imresize(plateCrop, 2);
-    focusedPlate = refinePlateCrop(plateCrop);
-    textRegion = extractTextRegion(focusedPlate);
+function app = buildFrontend()
+    screenSize = get(groot, 'ScreenSize');
+    windowWidth = min(1480, screenSize(3) - 80);
+    windowHeight = min(900, screenSize(4) - 80);
+    left = max(30, floor((screenSize(3) - windowWidth) / 2));
+    bottom = max(30, floor((screenSize(4) - windowHeight) / 2));
 
-    reflectionMask = textRegion > 230;
-    reflectionReduced = medfilt2(textRegion, [3 3]);
-    textRegion(reflectionMask) = reflectionReduced(reflectionMask);
+    fig = uifigure( ...
+        'Name', 'Vehicle Plate Detection Frontend', ...
+        'Position', [left bottom windowWidth windowHeight], ...
+        'Color', [0.95 0.96 0.98]);
 
-    enhancedPlate = adapthisteq(textRegion, 'NumTiles', [8 8], 'ClipLimit', 0.02);
-    enhancedPlate = medfilt2(enhancedPlate, [3 3]);
-    enhancedPlate = imsharpen(enhancedPlate, 'Radius', 1.0, 'Amount', 1.2);
+    mainPanel = uipanel(fig, ...
+        'Position', [0 0 windowWidth windowHeight], ...
+        'BorderType', 'none', ...
+        'BackgroundColor', [0.95 0.96 0.98], ...
+        'Scrollable', 'on');
 
-    darkText = imbinarize(enhancedPlate, 'adaptive', ...
-        'ForegroundPolarity', 'dark', 'Sensitivity', 0.42);
-    brightText = imbinarize(enhancedPlate, 'adaptive', ...
-        'ForegroundPolarity', 'bright', 'Sensitivity', 0.50);
+    contentWidth = windowWidth - 30;
+    contentHeight = 1340;
 
-    % Extra fallback for black plates with bright characters.
-    invertedPlate = imcomplement(enhancedPlate);
-    invertedBrightText = imbinarize(invertedPlate, 'adaptive', ...
-        'ForegroundPolarity', 'dark', 'Sensitivity', 0.48);
+    app = struct();
+    app.Figure = fig;
+    app.MainPanel = mainPanel;
+    app.RootDir = fileparts(fileparts(mfilename('fullpath')));
+    app.ImagePath = "";
+    app.OriginalImage = [];
+    app.Result = [];
 
-    darkText = cleanBinaryPlate(darkText);
-    brightText = cleanBinaryPlate(brightText);
-    invertedBrightText = cleanBinaryPlate(invertedBrightText);
+    app.HeaderCard = uipanel(mainPanel, ...
+        'Position', [15 contentHeight - 165 contentWidth 140], ...
+        'BackgroundColor', [0.98 0.99 1.00], ...
+        'BorderType', 'line', ...
+        'HighlightColor', [0.84 0.87 0.92]);
 
-    darkCount = countCharacterLikeComponents(darkText);
-    brightCount = countCharacterLikeComponents(brightText);
-    invertedCount = countCharacterLikeComponents(invertedBrightText);
+    app.Title = uilabel(app.HeaderCard, ...
+        'Position', [24 78 600 40], ...
+        'Text', 'Vehicle Car Plate Extraction', ...
+        'FontSize', 28, ...
+        'FontWeight', 'bold', ...
+        'FontColor', [0.12 0.16 0.22]);
 
-    if brightCount >= darkCount && brightCount >= invertedCount
-        bestBinary = brightText;
-        charCount = brightCount;
-    elseif invertedCount >= darkCount
-        bestBinary = invertedBrightText;
-        charCount = invertedCount;
-    else
-        bestBinary = darkText;
-        charCount = darkCount;
-    end
-end
+    app.Subtitle = uilabel(app.HeaderCard, ...
+        'Position', [24 48 820 24], ...
+        'Text', 'Upload a vehicle image, run plate detection, and review the extracted result in a cleaner workflow.', ...
+        'FontSize', 13, ...
+        'FontColor', [0.36 0.40 0.46]);
 
-function focusedPlate = refinePlateCrop(plateCrop)
-    [rows, cols] = size(plateCrop);
-    darkMask = plateCrop < 190;
-    darkMask = imclose(darkMask, strel('rectangle', [5 9]));
-    darkMask = imfill(darkMask, 'holes');
-    darkMask = bwareaopen(darkMask, 150);
+    app.UploadButton = uibutton(app.HeaderCard, 'push', ...
+        'Text', 'Upload Image', ...
+        'Position', [24 12 150 32], ...
+        'ButtonPushedFcn', @onUploadImage, ...
+        'BackgroundColor', [0.16 0.43 0.84], ...
+        'FontColor', [1 1 1], ...
+        'FontWeight', 'bold');
 
-    stats = regionprops(darkMask, 'BoundingBox', 'Area', 'Centroid');
-    focusedPlate = plateCrop;
-    bestScore = -inf;
-    bestBox = [];
+    app.ExtractButton = uibutton(app.HeaderCard, 'push', ...
+        'Text', 'Extract Plate', ...
+        'Position', [188 12 150 32], ...
+        'ButtonPushedFcn', @onExtractPlate, ...
+        'Enable', 'off', ...
+        'BackgroundColor', [0.14 0.63 0.34], ...
+        'FontColor', [1 1 1], ...
+        'FontWeight', 'bold');
 
-    for i = 1:numel(stats)
-        bbox = stats(i).BoundingBox;
-        centerX = stats(i).Centroid(1) / cols;
-        centerY = stats(i).Centroid(2) / rows;
-        aspectRatio = bbox(3) / bbox(4);
+    app.ClearButton = uibutton(app.HeaderCard, 'push', ...
+        'Text', 'Clear', ...
+        'Position', [352 12 100 32], ...
+        'ButtonPushedFcn', @onClearView, ...
+        'BackgroundColor', [0.94 0.95 0.97], ...
+        'FontColor', [0.20 0.23 0.28]);
 
-        if aspectRatio < 0.8 || aspectRatio > 6.5
-            continue;
+    app.ReportButton = uibutton(app.HeaderCard, 'push', ...
+        'Text', 'Detailed Report', ...
+        'Position', [466 12 140 32], ...
+        'ButtonPushedFcn', @onOpenDetailedReport, ...
+        'Enable', 'off', ...
+        'BackgroundColor', [0.94 0.95 0.97], ...
+        'FontColor', [0.20 0.23 0.28]);
+
+    app.ExportReportButton = uibutton(app.HeaderCard, 'push', ...
+        'Text', 'Export Report', ...
+        'Position', [620 12 140 32], ...
+        'ButtonPushedFcn', @onExportDetailedReport, ...
+        'Enable', 'off', ...
+        'BackgroundColor', [0.94 0.95 0.97], ...
+        'FontColor', [0.20 0.23 0.28]);
+
+    app.PathLabel = uilabel(mainPanel, ...
+        'Position', [24 contentHeight - 205 contentWidth - 48 24], ...
+        'Text', 'Selected image: none', ...
+        'FontSize', 12, ...
+        'FontColor', [0.28 0.31 0.36]);
+
+    app.StatusLabel = uilabel(mainPanel, ...
+        'Position', [24 contentHeight - 236 contentWidth - 48 24], ...
+        'Text', 'Status: waiting for image', ...
+        'FontSize', 12, ...
+        'FontColor', [0.40 0.44 0.50]);
+
+    leftWidth = floor(contentWidth * 0.64);
+    rightLeft = 15 + leftWidth + 20;
+    rightWidth = contentWidth - leftWidth - 35;
+
+    app.MainCard = uipanel(mainPanel, ...
+        'Title', 'Vehicle Preview', ...
+        'Position', [15 420 leftWidth 650], ...
+        'FontWeight', 'bold', ...
+        'BackgroundColor', [0.98 0.99 1.00]);
+
+    app.MainAxes = uiaxes(app.MainCard, ...
+        'Position', [18 18 leftWidth - 36 595], ...
+        'Box', 'on');
+    title(app.MainAxes, 'Vehicle Image');
+    axis(app.MainAxes, 'off');
+
+    app.ResultCard = uipanel(mainPanel, ...
+        'Title', 'Detected Plate Number', ...
+        'Position', [rightLeft 930 rightWidth 140], ...
+        'FontWeight', 'bold', ...
+        'BackgroundColor', [0.98 0.99 1.00]);
+
+    app.ResultValue = uilabel(app.ResultCard, ...
+        'Position', [20 62 rightWidth - 40 40], ...
+        'Text', 'Not detected yet', ...
+        'HorizontalAlignment', 'center', ...
+        'FontSize', 26, ...
+        'FontWeight', 'bold', ...
+        'FontColor', [0.14 0.18 0.24]);
+
+    app.ResultHint = uilabel(app.ResultCard, ...
+        'Position', [20 28 rightWidth - 40 24], ...
+        'Text', 'A reliable OCR result will appear here after extraction.', ...
+        'HorizontalAlignment', 'center', ...
+        'FontSize', 12, ...
+        'FontColor', [0.42 0.46 0.52]);
+
+    app.SummaryCard = uipanel(mainPanel, ...
+        'Title', 'Detection Summary', ...
+        'Position', [rightLeft 760 rightWidth 145], ...
+        'FontWeight', 'bold', ...
+        'BackgroundColor', [0.98 0.99 1.00]);
+
+    app.SummaryText = uitextarea(app.SummaryCard, ...
+        'Position', [14 14 rightWidth - 28 100], ...
+        'Editable', 'off', ...
+        'FontSize', 13, ...
+        'Value', {'Detection summary will appear here.'});
+
+    app.PlateCard = uipanel(mainPanel, ...
+        'Title', 'Detected Plate Region', ...
+        'Position', [rightLeft 505 rightWidth 225], ...
+        'FontWeight', 'bold', ...
+        'BackgroundColor', [0.98 0.99 1.00]);
+
+    app.PlateAxes = uiaxes(app.PlateCard, ...
+        'Position', [14 14 rightWidth - 28 180], ...
+        'Box', 'on');
+    title(app.PlateAxes, 'Plate Crop');
+    axis(app.PlateAxes, 'off');
+
+    app.BinaryCard = uipanel(mainPanel, ...
+        'Title', 'Plate Evidence', ...
+        'Position', [rightLeft 250 rightWidth 225], ...
+        'FontWeight', 'bold', ...
+        'BackgroundColor', [0.98 0.99 1.00]);
+
+    app.BinaryAxes = uiaxes(app.BinaryCard, ...
+        'Position', [14 14 rightWidth - 28 180], ...
+        'Box', 'on');
+    title(app.BinaryAxes, 'Binary Evidence');
+    axis(app.BinaryAxes, 'off');
+
+    app.InfoCard = uipanel(mainPanel, ...
+        'Title', 'Session Notes', ...
+        'Position', [15 205 contentWidth 190], ...
+        'FontWeight', 'bold', ...
+        'BackgroundColor', [0.98 0.99 1.00]);
+
+    app.InfoText = uitextarea(app.InfoCard, ...
+        'Position', [14 14 contentWidth - 28 145], ...
+        'Editable', 'off', ...
+        'FontSize', 13, ...
+        'Value', { ...
+            'How to use:', ...
+            '1. Click Upload Image.', ...
+            '2. Choose a vehicle image.', ...
+            '3. Click Extract Plate to run the current MATLAB method.', ...
+            '4. Scroll to review the crop, binary evidence, and result summary.'});
+
+    app.MethodCard = uipanel(mainPanel, ...
+        'Title', 'Current Detection Method', ...
+        'Position', [15 15 contentWidth 165], ...
+        'FontWeight', 'bold', ...
+        'BackgroundColor', [0.98 0.99 1.00]);
+
+    app.MethodText = uitextarea(app.MethodCard, ...
+        'Position', [14 14 contentWidth - 28 120], ...
+        'Editable', 'off', ...
+        'FontSize', 12, ...
+        'Value', { ...
+            'Method summary:', ...
+            'This version uses a fallback MATLAB pipeline with a new grouped-text detector first.', ...
+            '1. Try detector v4 first using character grouping and OCR on the strongest plate band.', ...
+            '2. Accept the result only if OCR contains both letters and numbers in a plate-like Malaysian pattern.', ...
+            '3. If v4 fails that check, try v2, then v1.', ...
+            '4. If those still fail, use the OCR-first v3 fallback.'});
+
+    guidata(fig, app);
+
+    function onUploadImage(~, ~)
+        currentApp = guidata(fig);
+        startFolder = fullfile(currentApp.RootDir, 'DataSet', 'images');
+        if ~isfolder(startFolder)
+            startFolder = pwd;
         end
 
-        score = stats(i).Area ...
-            - abs(centerX - 0.5) * 500 ...
-            - abs(centerY - 0.5) * 300;
+        [fileName, filePath] = uigetfile( ...
+            {'*.jpg;*.jpeg;*.png;*.bmp', 'Image Files (*.jpg, *.jpeg, *.png, *.bmp)'}, ...
+            'Select Vehicle Image', ...
+            startFolder);
 
-        if score > bestScore
-            bestScore = score;
-            bestBox = bbox;
+        if isequal(fileName, 0)
+            return;
         end
+
+        selectedPath = fullfile(filePath, fileName);
+        currentApp.ImagePath = string(selectedPath);
+        currentApp.Result = [];
+
+        try
+            currentApp.OriginalImage = imread(selectedPath);
+            imshow(currentApp.OriginalImage, 'Parent', currentApp.MainAxes);
+            title(currentApp.MainAxes, 'Vehicle Image');
+            cla(currentApp.PlateAxes);
+            title(currentApp.PlateAxes, 'Plate Crop');
+            cla(currentApp.BinaryAxes);
+            title(currentApp.BinaryAxes, 'Binary Evidence');
+
+            currentApp.PathLabel.Text = ['Selected image: ' selectedPath];
+            currentApp.StatusLabel.Text = 'Status: image loaded, ready for extraction';
+            currentApp.ResultValue.Text = 'Ready to extract';
+            currentApp.ResultValue.FontColor = [0.14 0.18 0.24];
+            currentApp.ResultHint.Text = 'Click Extract Plate to run the current method.';
+            currentApp.SummaryText.Value = {'Detection summary will appear here.'};
+            currentApp.InfoText.Value = { ...
+                'Image loaded successfully.', ...
+                'Scroll through the cards to inspect the result after extraction.', ...
+                'This UI is using your current classical detector method.'};
+            currentApp.ExtractButton.Enable = 'on';
+            currentApp.ReportButton.Enable = 'off';
+            currentApp.ExportReportButton.Enable = 'off';
+        catch readError
+            currentApp.StatusLabel.Text = 'Status: failed to load image';
+            currentApp.ResultValue.Text = 'Load failed';
+            currentApp.ResultValue.FontColor = [0.78 0.20 0.20];
+            currentApp.ResultHint.Text = 'Check the selected image file and try again.';
+            currentApp.SummaryText.Value = {['Error: ' readError.message]};
+            currentApp.ExtractButton.Enable = 'off';
+            currentApp.ReportButton.Enable = 'off';
+            currentApp.ExportReportButton.Enable = 'off';
+        end
+
+        guidata(fig, currentApp);
     end
 
-    if ~isempty(bestBox)
-        focusedPlate = imcrop(plateCrop, expandBoundingBox(bestBox, rows, cols, 0.08, 0.08));
-    end
-end
+    function onExtractPlate(~, ~)
+        currentApp = guidata(fig);
+        if strlength(currentApp.ImagePath) == 0
+            uialert(fig, 'Please upload an image first.', 'No Image Selected');
+            return;
+        end
 
-function textRegion = extractTextRegion(focusedPlate)
-    [rows, cols] = size(focusedPlate);
-    textRegion = focusedPlate;
+        currentApp.StatusLabel.Text = 'Status: running fallback plate extraction (v4 -> v2 -> v1 -> v3)...';
+        currentApp.ResultValue.Text = 'Processing...';
+        currentApp.ResultValue.FontColor = [0.16 0.43 0.84];
+        currentApp.ResultHint.Text = 'Please wait while MATLAB analyzes the image.';
+        currentApp.ExtractButton.Enable = 'off';
+        drawnow;
 
-    darkChars = focusedPlate < 170;
-    darkChars = bwareaopen(darkChars, 20);
-
-    brightChars = focusedPlate > 150;
-    brightChars = bwareaopen(brightChars, 20);
-
-    masks = {darkChars, brightChars};
-    bestScore = -inf;
-    bestBox = [];
-
-    for k = 1:numel(masks)
-        currentMask = masks{k};
-        currentMask = imclose(currentMask, strel('rectangle', [3 3]));
-        stats = regionprops(currentMask, 'BoundingBox', 'Area', 'Centroid');
-
-        for i = 1:numel(stats)
-            bbox = stats(i).BoundingBox;
-            aspectRatio = bbox(3) / bbox(4);
-            centerY = stats(i).Centroid(2) / rows;
-
-            if bbox(3) < cols * 0.08 || bbox(4) < rows * 0.18
-                continue;
+        try
+            result = extractCarPlateFromImage(char(currentApp.ImagePath));
+            currentApp.Result = result;
+            showDetectionResult(currentApp, result);
+            currentApp.StatusLabel.Text = 'Status: extraction completed';
+            if hasDetailedReport(result)
+                currentApp.ReportButton.Enable = 'on';
+                currentApp.ExportReportButton.Enable = 'on';
             end
+        catch extractionError
+            currentApp.StatusLabel.Text = 'Status: extraction failed';
+            currentApp.ResultValue.Text = 'Extraction failed';
+            currentApp.ResultValue.FontColor = [0.78 0.20 0.20];
+            currentApp.ResultHint.Text = 'The fallback pipeline could not finish cleanly.';
+            currentApp.SummaryText.Value = {['Error: ' extractionError.message]};
+            currentApp.InfoText.Value = { ...
+                'The pipeline could not finish.', ...
+                'Check that MATLAB OCR and Image Processing Toolbox features are available.', ...
+                'Then try another clearer image.'};
+            currentApp.ReportButton.Enable = 'off';
+            currentApp.ExportReportButton.Enable = 'off';
+        end
 
-            if aspectRatio < 0.15 || aspectRatio > 1.3
-                continue;
-            end
+        currentApp.ExtractButton.Enable = 'on';
+        guidata(fig, currentApp);
+    end
 
-            score = stats(i).Area - abs(centerY - 0.5) * 150;
+    function onClearView(~, ~)
+        currentApp = guidata(fig);
+        currentApp.ImagePath = "";
+        currentApp.OriginalImage = [];
+        currentApp.Result = [];
 
-            if score > bestScore
-                bestScore = score;
-                bestBox = bbox;
-            end
+        cla(currentApp.MainAxes);
+        title(currentApp.MainAxes, 'Vehicle Image');
+        cla(currentApp.PlateAxes);
+        title(currentApp.PlateAxes, 'Plate Crop');
+        cla(currentApp.BinaryAxes);
+        title(currentApp.BinaryAxes, 'Binary Evidence');
+
+        currentApp.PathLabel.Text = 'Selected image: none';
+        currentApp.StatusLabel.Text = 'Status: waiting for image';
+        currentApp.ResultValue.Text = 'Not detected yet';
+        currentApp.ResultValue.FontColor = [0.14 0.18 0.24];
+        currentApp.ResultHint.Text = 'A reliable OCR result will appear here after extraction.';
+        currentApp.SummaryText.Value = {'Detection summary will appear here.'};
+        currentApp.InfoText.Value = { ...
+            'How to use:', ...
+            '1. Click Upload Image.', ...
+            '2. Choose a vehicle image.', ...
+            '3. Click Extract Plate to run the current MATLAB method.', ...
+            '4. Scroll to review the crop, binary evidence, and result summary.'};
+        currentApp.ExtractButton.Enable = 'off';
+        currentApp.ReportButton.Enable = 'off';
+        currentApp.ExportReportButton.Enable = 'off';
+
+        guidata(fig, currentApp);
+    end
+
+    function onOpenDetailedReport(~, ~)
+        currentApp = guidata(fig);
+        if isempty(currentApp.Result) || ~hasDetailedReport(currentApp.Result)
+            uialert(fig, 'Run plate extraction first to generate the debug report.', 'No Report Available');
+            return;
+        end
+
+        try
+            showDetailedReportWindow(currentApp.Result);
+        catch reportError
+            warning('PlateReport:OpenFailed', 'Detailed report window failed: %s', reportError.message);
+            uialert(fig, sprintf('Could not open the detailed report window.%s%s', ...
+                newline, reportError.message), ...
+                'Detailed Report Error', 'Icon', 'warning');
         end
     end
 
-    if ~isempty(bestBox)
-        x1 = max(1, floor(bestBox(1) - cols * 0.06));
-        y1 = max(1, floor(bestBox(2) - rows * 0.10));
-        x2 = min(cols, ceil(bestBox(1) + bestBox(3) + cols * 0.06));
-        y2 = min(rows, ceil(bestBox(2) + bestBox(4) + rows * 0.10));
-        textRegion = focusedPlate(y1:y2, x1:x2);
-        return;
-    end
-
-    % Fallback: keep the central band and ignore thick plate borders/frame.
-    y1 = max(1, round(rows * 0.18));
-    y2 = min(rows, round(rows * 0.82));
-    x1 = max(1, round(cols * 0.08));
-    x2 = min(cols, round(cols * 0.92));
-    textRegion = focusedPlate(y1:y2, x1:x2);
-end
-
-function refinedBox = refinePlateBox(grayImage, initialBox)
-    [rows, cols] = size(grayImage);
-    localCrop = imcrop(grayImage, initialBox);
-    localCrop = im2uint8(localCrop);
-
-    darkMask = localCrop < 200;
-    darkMask = imclose(darkMask, strel('rectangle', [5 11]));
-    darkMask = imfill(darkMask, 'holes');
-    darkMask = bwareaopen(darkMask, 120);
-
-    edgeMask = edge(localCrop, 'Canny');
-    edgeMask = imclose(edgeMask, strel('rectangle', [3 15]));
-    edgeMask = imfill(edgeMask, 'holes');
-    edgeMask = bwareaopen(edgeMask, 120);
-
-    combinedMask = darkMask | edgeMask;
-    stats = regionprops(combinedMask, 'BoundingBox', 'Area', 'Extent', 'Solidity', 'Centroid');
-
-    refinedBox = initialBox;
-    bestScore = -inf;
-
-    for i = 1:numel(stats)
-        bbox = stats(i).BoundingBox;
-        aspectRatio = bbox(3) / bbox(4);
-        centerX = stats(i).Centroid(1) / size(localCrop, 2);
-        centerY = stats(i).Centroid(2) / size(localCrop, 1);
-
-        if aspectRatio < 1.0 || aspectRatio > 7.5
-            continue;
+    function onExportDetailedReport(~, ~)
+        currentApp = guidata(fig);
+        if isempty(currentApp.Result) || ~hasDetailedReport(currentApp.Result)
+            uialert(fig, 'Run plate extraction first to generate the debug report.', 'No Report Available');
+            return;
         end
 
-        score = stats(i).Area ...
-            + stats(i).Extent * 150 ...
-            + stats(i).Solidity * 100 ...
-            - abs(centerX - 0.5) * 200 ...
-            - abs(centerY - 0.55) * 160;
-
-        if score > bestScore
-            bestScore = score;
-            x1 = max(1, floor(initialBox(1) + bbox(1) - 1));
-            y1 = max(1, floor(initialBox(2) + bbox(2) - 1));
-            x2 = min(cols, ceil(x1 + bbox(3)));
-            y2 = min(rows, ceil(y1 + bbox(4)));
-            refinedBox = expandBoundingBox([x1, y1, x2 - x1, y2 - y1], rows, cols, 0.10, 0.10);
-        end
-    end
-end
-
-function [recognizedText, textConfidence] = runPlateOCR(focusedPlate, textRegion, enhancedPlate, binaryPlate)
-    ocrFocused = ocr(im2uint8(focusedPlate));
-    textFocused = cleanPlateText(ocrFocused.Text);
-    confFocused = meanConfidence(ocrFocused);
-
-    ocrTextRegion = ocr(im2uint8(textRegion));
-    textTextRegion = cleanPlateText(ocrTextRegion.Text);
-    confTextRegion = meanConfidence(ocrTextRegion);
-
-    ocrGray = ocr(im2uint8(enhancedPlate));
-    textGray = cleanPlateText(ocrGray.Text);
-    confGray = meanConfidence(ocrGray);
-
-    ocrBinary = ocr(im2uint8(binaryPlate));
-    textBinary = cleanPlateText(ocrBinary.Text);
-    confBinary = meanConfidence(ocrBinary);
-
-    scoreFocused = plateTextScore(textFocused, confFocused);
-    scoreTextRegion = plateTextScore(textTextRegion, confTextRegion);
-    scoreGray = plateTextScore(textGray, confGray);
-    scoreBinary = plateTextScore(textBinary, confBinary);
-
-    if scoreTextRegion >= scoreFocused && scoreTextRegion >= scoreGray && scoreTextRegion >= scoreBinary
-        recognizedText = textTextRegion;
-        textConfidence = confTextRegion;
-    elseif scoreFocused >= scoreGray && scoreFocused >= scoreBinary
-        recognizedText = textFocused;
-        textConfidence = confFocused;
-    elseif scoreGray >= scoreBinary
-        recognizedText = textGray;
-        textConfidence = confGray;
-    else
-        recognizedText = textBinary;
-        textConfidence = confBinary;
-    end
-
-    recognizedText = formatPlateText(recognizedText);
-end
-
-function recognizedText = segmentPlateText(binaryPlate)
-    recognizedText = "";
-
-    binaryPlate = logical(binaryPlate);
-    binaryPlate = imclearborder(binaryPlate);
-    binaryPlate = bwareaopen(binaryPlate, 20);
-
-    if nnz(binaryPlate) == 0
-        return;
-    end
-
-    rowProfile = sum(binaryPlate, 2);
-    rowMask = rowProfile > max(rowProfile) * 0.18;
-
-    if any(rowMask)
-        rowStarts = find(diff([0; rowMask]) == 1);
-        rowEnds = find(diff([rowMask; 0]) == -1);
-    else
-        rowStarts = 1;
-        rowEnds = size(binaryPlate, 1);
-    end
-
-    lines = strings(0);
-
-    for r = 1:numel(rowStarts)
-        lineImage = binaryPlate(rowStarts(r):rowEnds(r), :);
-        lineText = readPlateLine(lineImage);
-
-        if strlength(lineText) > 0
-            lines(end + 1) = lineText; %#ok<AGROW>
-        end
-    end
-
-    if isempty(lines)
-        return;
-    end
-
-    recognizedText = strjoin(lines, " ");
-    recognizedText = formatPlateText(recognizedText);
-end
-
-function lineText = readPlateLine(lineImage)
-    lineText = "";
-    lineImage = imclearborder(lineImage);
-    lineImage = bwareaopen(lineImage, 15);
-
-    cc = bwconncomp(lineImage);
-    stats = regionprops(cc, 'BoundingBox', 'Area');
-
-    if isempty(stats)
-        return;
-    end
-
-    boxes = reshape([stats.BoundingBox], 4, []).';
-    areas = [stats.Area].';
-
-    keep = false(size(areas));
-    for i = 1:numel(areas)
-        aspectRatio = boxes(i, 3) / boxes(i, 4);
-        if areas(i) >= 15 && areas(i) <= 4000 && aspectRatio >= 0.08 && aspectRatio <= 1.5
-            keep(i) = true;
-        end
-    end
-
-    boxes = boxes(keep, :);
-
-    if isempty(boxes)
-        return;
-    end
-
-    [~, order] = sort(boxes(:, 1));
-    boxes = boxes(order, :);
-
-    chars = strings(0);
-    for i = 1:size(boxes, 1)
-        charBox = boxes(i, :);
-        charImage = imcrop(lineImage, charBox);
-        charImage = padarray(charImage, [8 8], 0, 'both');
-        charImage = imresize(charImage, [64 48], 'nearest');
-
-        ocrResult = ocr(im2uint8(charImage));
-        charText = cleanPlateText(ocrResult.Text);
-
-        if strlength(charText) >= 1
-            chars(end + 1) = extractBetween(charText, 1, 1); %#ok<AGROW>
-        end
-    end
-
-    if ~isempty(chars)
-        lineText = join(chars, "");
-        lineText = string(lineText);
-    end
-end
-
-function recognizedText = readPlateByLines(focusedPlate, textRegion, enhancedPlate, binaryPlate)
-    recognizedText = "";
-    variants = {im2uint8(textRegion), im2uint8(focusedPlate), im2uint8(enhancedPlate), im2uint8(binaryPlate) * 255};
-    bestText = "";
-    bestScore = -inf;
-
-    for v = 1:numel(variants)
-        currentImage = variants{v};
-        [rows, ~] = size(currentImage);
-
-        % Whole plate OCR
-        wholeResult = ocr(currentImage);
-        wholeText = formatPlateText(cleanPlateText(wholeResult.Text));
-        wholeScore = plateTextScore(wholeText, meanConfidence(wholeResult));
-
-        if wholeScore > bestScore
-            bestScore = wholeScore;
-            bestText = wholeText;
-        end
-
-        % Two-line OCR for stacked Malaysian plates such as SWC / 333.
-        topHalf = currentImage(1:max(1, round(rows * 0.55)), :);
-        bottomHalf = currentImage(max(1, round(rows * 0.35)):end, :);
-
-        topResult = ocr(topHalf);
-        bottomResult = ocr(bottomHalf);
-
-        topText = cleanPlateText(topResult.Text);
-        bottomText = cleanPlateText(bottomResult.Text);
-
-        combinedText = formatPlateText(topText + " " + bottomText);
-        combinedScore = plateTextScore(combinedText, mean([meanConfidence(topResult), meanConfidence(bottomResult)], 'omitnan'));
-
-        if combinedScore > bestScore
-            bestScore = combinedScore;
-            bestText = combinedText;
-        end
-    end
-
-    recognizedText = bestText;
-end
-
-function score = plateTextScore(textValue, confidence)
-    score = strlength(textValue) * 10;
-
-    if ~isnan(confidence)
-        score = score + confidence / 5;
-    end
-
-    if strlength(textValue) >= 3 && strlength(textValue) <= 10
-        score = score + 20;
-    end
-
-    if any(isstrprop(char(textValue), 'alpha')) && any(isstrprop(char(textValue), 'digit'))
-        score = score + 15;
-    end
-
-    % Malaysian plates commonly have 1-3 letters followed by 1-4 digits.
-    if ~isempty(regexp(char(textValue), '^[A-Z]{1,3}\d{1,4}[A-Z]?$|^[A-Z]{1,3}\s\d{1,4}[A-Z]?$', 'once'))
-        score = score + 30;
-    end
-
-    % Penalize all-letter outputs like LEHBO when the plate clearly should contain digits.
-    if all(isstrprop(char(textValue), 'alpha'))
-        score = score - 25;
-    end
-end
-
-function formattedText = formatPlateText(rawText)
-    rawText = upper(string(rawText));
-    rawText = regexprep(rawText, '\s+', '');
-    rawText = regexprep(rawText, '[^A-Z0-9]', '');
-
-    formattedText = rawText;
-
-    if strlength(rawText) >= 3 && strlength(rawText) <= 10
-        firstDigitIndex = regexp(char(rawText), '\d', 'once');
-
-        if ~isempty(firstDigitIndex) && firstDigitIndex > 1
-            prefix = extractBetween(rawText, 1, firstDigitIndex - 1);
-            suffix = extractAfter(rawText, firstDigitIndex - 1);
-
-            if strlength(prefix) >= 1 && strlength(prefix) <= 3 && ...
-                    strlength(suffix) >= 1 && strlength(suffix) <= 4
-                formattedText = prefix + " " + suffix;
+        try
+            exportFolder = exportDetailedReport(currentApp.Result);
+            uialert(fig, sprintf('Detailed report saved to:%s%s', newline, exportFolder), ...
+                'Report Saved', 'Icon', 'success');
+        catch exportError
+            warning('PlateReport:ExportFailed', 'Detailed report export failed: %s', exportError.message);
+            try
+                fallbackFolder = exportDetailedReportFallback(currentApp.Result);
+                uialert(fig, sprintf(['Detailed report export hit a graphics issue.%s%s%s' ...
+                    'Saved fallback report to:%s%s'], ...
+                    newline, exportError.message, newline, newline, fallbackFolder), ...
+                    'Report Saved With Fallback', 'Icon', 'warning');
+            catch fallbackError
+                warning('PlateReport:FallbackExportFailed', ...
+                    'Fallback detailed report export failed: %s', fallbackError.message);
+                uialert(fig, sprintf(['Detailed report export failed.%s%s%s' ...
+                    'Fallback export also failed:%s%s'], ...
+                    newline, exportError.message, newline, newline, fallbackError.message), ...
+                    'Report Export Error', 'Icon', 'error');
             end
         end
     end
 end
 
-function confidence = meanConfidence(ocrResult)
-    if isempty(ocrResult.CharacterConfidences)
-        confidence = NaN;
-    else
-        confidence = mean(ocrResult.CharacterConfidences);
-    end
-end
+function showDetectionResult(app, result)
+    imshow(result.Image, 'Parent', app.MainAxes);
+    hold(app.MainAxes, 'on');
 
-function binaryPlate = cleanBinaryPlate(binaryPlate)
-    binaryPlate = imclearborder(binaryPlate);
-    binaryPlate = bwareaopen(binaryPlate, 25);
-    binaryPlate = imclose(binaryPlate, strel('rectangle', [3 3]));
-    binaryPlate = imopen(binaryPlate, strel('rectangle', [2 2]));
-end
+    if ~isempty(result.PlateBox)
+        rectangle(app.MainAxes, ...
+            'Position', result.PlateBox, ...
+            'EdgeColor', [0.10 0.85 0.35], ...
+            'LineWidth', 2.2);
 
-function charCount = countCharacterLikeComponents(binaryImage)
-    cc = bwconncomp(binaryImage);
-    stats = regionprops(cc, 'BoundingBox', 'Area');
-    charCount = 0;
-
-    for j = 1:numel(stats)
-        box = stats(j).BoundingBox;
-        aspectRatio = box(3) / box(4);
-        area = stats(j).Area;
-
-        if area > 20 && area < 2500 && aspectRatio > 0.08 && aspectRatio < 1.4
-            charCount = charCount + 1;
+        if result.IsPlateTextValid
+            text(app.MainAxes, ...
+                result.PlateBox(1), ...
+                max(result.PlateBox(2) - 12, 12), ...
+                char(result.PlateText), ...
+                'Color', 'yellow', ...
+                'BackgroundColor', 'black', ...
+                'FontSize', 13, ...
+                'FontWeight', 'bold', ...
+                'Margin', 2);
+            title(app.MainAxes, ['Detected Plate: ' char(result.PlateText)]);
+        else
+            title(app.MainAxes, 'Plate Region Detected');
         end
+    else
+        for n = 1:size(result.CandidateBoxes, 1)
+            rectangle(app.MainAxes, ...
+                'Position', result.CandidateBoxes(n, :), ...
+                'EdgeColor', [0.93 0.70 0.12], ...
+                'LineWidth', 1.2);
+        end
+        title(app.MainAxes, 'No Reliable Plate Found');
     end
+
+    hold(app.MainAxes, 'off');
+
+    if ~isempty(result.PlateImage)
+        imshow(result.PlateImage, 'Parent', app.PlateAxes);
+        title(app.PlateAxes, 'Detected Plate Crop');
+    else
+        cla(app.PlateAxes);
+        title(app.PlateAxes, 'Detected Plate Crop');
+    end
+
+    if ~isempty(result.BinaryPlate)
+        imshow(result.BinaryPlate, 'Parent', app.BinaryAxes);
+        title(app.BinaryAxes, 'Binary Plate Evidence');
+    else
+        cla(app.BinaryAxes);
+        title(app.BinaryAxes, 'Binary Plate Evidence');
+    end
+
+    if result.IsPlateTextValid
+        app.ResultValue.Text = char(result.PlateText);
+        app.ResultValue.FontColor = [0.10 0.55 0.30];
+        app.ResultHint.Text = ['Accepted from ' char(result.MethodUsed) '.'];
+        app.SummaryText.Value = { ...
+            'Detected plate text:', ...
+            char(result.PlateText), ...
+            ['Accepted method: ' char(result.MethodUsed)], ...
+            'Review the crop and binary evidence cards below for quality.'};
+    elseif ~isempty(result.PlateBox)
+        app.ResultValue.Text = 'Low-confidence candidate';
+        app.ResultValue.FontColor = [0.86 0.54 0.05];
+        if strlength(result.PlateText) > 0
+            app.ResultHint.Text = 'Plate candidate found, but OCR is not reliable enough for final acceptance.';
+            app.SummaryText.Value = { ...
+                'Plate candidate detected.', ...
+                ['Low-confidence OCR text: ' char(result.PlateText)], ...
+                ['Best fallback method tried: ' char(result.MethodUsed)], ...
+                'Inspect the crop and binary evidence before trusting this read.'};
+        else
+            app.ResultHint.Text = 'A region was found, but none of the fallback OCR results looked plate-like.';
+            app.SummaryText.Value = { ...
+                'Plate region detected.', ...
+                'OCR text is still uncertain for this image.', ...
+                ['Best fallback method tried: ' char(result.MethodUsed)], ...
+                'Inspect the crop and binary evidence to judge the result.'};
+        end
+    else
+        app.ResultValue.Text = 'No plate detected';
+        app.ResultValue.FontColor = [0.78 0.20 0.20];
+        app.ResultHint.Text = 'No strong plate candidate matched the current rules.';
+        app.SummaryText.Value = { ...
+            'No reliable plate region detected.', ...
+            'Try another image with a clearer plate area.'};
+    end
+
+    app.InfoText.Value = { ...
+        ['Methods tried: ' strjoin(cellstr(result.AttemptedMethods), ' -> ')], ...
+        ['Candidates checked: ' num2str(size(result.CandidateBoxes, 1))], ...
+        'Green rectangle shows the best selected region when available.', ...
+        'Plate crop and binary evidence are separated into their own cards for easier review.', ...
+        'Use Detailed Report to inspect steps, or Export Report to save them without opening extra UI.'};
 end
 
-function expandedBox = expandBoundingBox(bbox, rows, cols, yPadRatio, xPadRatio)
-    x = bbox(1);
-    y = bbox(2);
-    w = bbox(3);
-    h = bbox(4);
-
-    xPad = w * xPadRatio;
-    yPad = h * yPadRatio;
-
-    x1 = max(1, floor(x - xPad));
-    y1 = max(1, floor(y - yPad));
-    x2 = min(cols, ceil(x + w + xPad));
-    y2 = min(rows, ceil(y + h + yPad));
-
-    expandedBox = [x1, y1, x2 - x1, y2 - y1];
+function tf = hasDetailedReport(result)
+    tf = isstruct(result) && isfield(result, 'DebugReport') && ...
+        isstruct(result.DebugReport) && isfield(result.DebugReport, 'Attempts') && ...
+        ~isempty(result.DebugReport.Attempts);
 end
 
-function cleanedText = cleanPlateText(rawText)
-    cleanedText = upper(string(rawText));
-    cleanedText = regexprep(cleanedText, '[^A-Z0-9]', '');
-end
+function showDetailedReportWindow(result)
+    report = result.DebugReport;
+    windowWidth = 1280;
+    windowHeight = 820;
+    totalHeight = 90;
+    cardWidth = 1220;
+    for i = 1:numel(report.Attempts)
+        stepCount = numel(report.Attempts(i).Steps);
+        stepRows = max(1, ceil(stepCount / 2));
+        totalHeight = totalHeight + 120 + stepRows * 290 + 20;
+    end
+    canvasHeight = max(820, totalHeight);
 
-function imageData = loadVehicleImage(imagePath)
-    imageData = imread(imagePath);
+    reportFigure = uifigure( ...
+        'Name', 'Plate Detection Detailed Report', ...
+        'Position', [80 60 windowWidth windowHeight], ...
+        'Color', [0.95 0.96 0.98]);
 
-    try
-        imageInfo = imfinfo(imagePath);
+    scrollPanel = uipanel(reportFigure, ...
+        'Position', [0 0 windowWidth windowHeight], ...
+        'BorderType', 'none', ...
+        'BackgroundColor', [0.95 0.96 0.98], ...
+        'Scrollable', 'on');
 
-        if isfield(imageInfo, 'Orientation')
-            orientation = imageInfo.Orientation;
+    headerText = sprintf('Methods tried: %s | Selected: %s', ...
+        strjoin(cellstr(report.AttemptedMethods), ' -> '), char(report.SelectedMethod));
+    uilabel(scrollPanel, ...
+        'Position', [20 canvasHeight - 48 1200 28], ...
+        'Text', headerText, ...
+        'FontSize', 16, ...
+        'FontWeight', 'bold', ...
+        'FontColor', [0.12 0.16 0.22]);
 
-            if isnumeric(orientation)
-                switch orientation
-                    case 3
-                        imageData = rot90(imageData, 2);
-                    case 6
-                        imageData = rot90(imageData, -1);
-                    case 8
-                        imageData = rot90(imageData, 1);
-                end
+    yTop = canvasHeight - 80;
+
+    for i = 1:numel(report.Attempts)
+        attempt = report.Attempts(i);
+        stepCount = numel(attempt.Steps);
+        stepRows = max(1, ceil(stepCount / 2));
+        cardHeight = 120 + stepRows * 290;
+
+        card = uipanel(scrollPanel, ...
+            'Title', sprintf('Method %s | Status: %s', upper(char(attempt.Method)), char(attempt.Status)), ...
+            'Position', [20 yTop - cardHeight cardWidth cardHeight], ...
+            'FontWeight', 'bold', ...
+            'BackgroundColor', [0.98 0.99 1.00]);
+
+        notesText = char(string(attempt.Notes));
+        if strlength(string(attempt.Notes)) == 0
+            notesText = 'No additional notes.';
+        end
+
+        uilabel(card, ...
+            'Position', [14 cardHeight - 48 cardWidth - 28 28], ...
+            'Text', notesText, ...
+            'FontSize', 12, ...
+            'FontColor', [0.36 0.40 0.46]);
+
+        for stepIndex = 1:stepCount
+            currentStep = attempt.Steps(stepIndex);
+            rowIndex = floor((stepIndex - 1) / 2);
+            colIndex = mod(stepIndex - 1, 2);
+            panelWidth = floor((cardWidth - 42) / 2);
+            stepX = 14 + colIndex * (panelWidth + 14);
+            stepY = cardHeight - 90 - (rowIndex + 1) * 270;
+
+            stepPanel = uipanel(card, ...
+                'Title', char(currentStep.Title), ...
+                'Position', [stepX stepY panelWidth 250], ...
+                'BackgroundColor', [1 1 1]);
+
+            stepAxes = uiaxes(stepPanel, ...
+                'Position', [10 48 panelWidth - 20 180], ...
+                'Box', 'on');
+            axis(stepAxes, 'off');
+
+            if ~isempty(currentStep.Image)
+                imshow(currentStep.Image, 'Parent', stepAxes);
             else
-                orientationText = lower(string(orientation));
-
-                if contains(orientationText, "180")
-                    imageData = rot90(imageData, 2);
-                elseif contains(orientationText, "90") && ...
-                        (contains(orientationText, "clockwise") || contains(orientationText, "right"))
-                    imageData = rot90(imageData, -1);
-                elseif contains(orientationText, "90") && ...
-                        (contains(orientationText, "counter") || contains(orientationText, "left"))
-                    imageData = rot90(imageData, 1);
-                end
+                title(stepAxes, 'No image available');
             end
+
+            stepDescription = char(string(currentStep.Description));
+            uitextarea(stepPanel, ...
+                'Position', [10 8 panelWidth - 20 36], ...
+                'Editable', 'off', ...
+                'Value', {stepDescription}, ...
+                'FontSize', 11);
         end
-    catch
-        % Keep the original image if EXIF orientation is unavailable.
+
+        if stepCount == 0
+            uitextarea(card, ...
+                'Position', [14 14 cardWidth - 28 cardHeight - 80], ...
+                'Editable', 'off', ...
+                'Value', {'No intermediate steps were captured for this method.'}, ...
+                'FontSize', 12);
+        end
+
+        yTop = yTop - cardHeight - 20;
     end
+end
+
+function exportFolder = exportDetailedReport(result)
+    report = result.DebugReport;
+    reportRoot = fullfile(getDefaultDownloadsFolder(), 'PlateDetectionReports');
+    if ~isfolder(reportRoot)
+        mkdir(reportRoot);
+    end
+
+    timestamp = string(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+    exportFolder = fullfile(reportRoot, ['PlateReport_' char(timestamp)]);
+    mkdir(exportFolder);
+
+    for i = 1:numel(report.Attempts)
+        attempt = report.Attempts(i);
+        methodFolder = fullfile(exportFolder, upper(char(attempt.Method)));
+        if ~isfolder(methodFolder)
+            mkdir(methodFolder);
+        end
+        try
+            exportMethodReportImage(attempt, methodFolder);
+        catch exportError
+            warning('PlateReport:MethodExportFailed', ...
+                'Method %s report export failed: %s', char(attempt.Method), exportError.message);
+            writeAttemptFallbackSummary(attempt, methodFolder, exportError);
+        end
+    end
+end
+
+function exportFolder = exportDetailedReportFallback(result)
+    report = result.DebugReport;
+    reportRoot = fullfile(getDefaultDownloadsFolder(), 'PlateDetectionReports');
+    if ~isfolder(reportRoot)
+        mkdir(reportRoot);
+    end
+
+    timestamp = string(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+    exportFolder = fullfile(reportRoot, ['PlateReport_Fallback_' char(timestamp)]);
+    mkdir(exportFolder);
+
+    for i = 1:numel(report.Attempts)
+        attempt = report.Attempts(i);
+        methodFolder = fullfile(exportFolder, upper(char(attempt.Method)));
+        if ~isfolder(methodFolder)
+            mkdir(methodFolder);
+        end
+        writeAttemptFallbackSummary(attempt, methodFolder, []);
+    end
+end
+
+function folderPath = getDefaultDownloadsFolder()
+    userProfile = getenv('USERPROFILE');
+    if ~isempty(userProfile)
+        downloadsPath = fullfile(userProfile, 'Downloads');
+        if isfolder(downloadsPath)
+            folderPath = downloadsPath;
+            return;
+        end
+    end
+
+    folderPath = pwd;
+end
+
+function safeName = sanitizeFileName(fileName)
+    safeName = regexprep(string(fileName), '[^A-Za-z0-9_-]', '_');
+    safeName = regexprep(safeName, '_+', '_');
+    safeName = char(safeName);
+end
+
+function writableImage = makeWritableImage(imageData)
+    if islogical(imageData)
+        writableImage = uint8(imageData) * 255;
+        return;
+    end
+
+    if isa(imageData, 'uint8') || isa(imageData, 'uint16')
+        writableImage = imageData;
+        return;
+    end
+
+    if isfloat(imageData)
+        writableImage = im2uint8(mat2gray(imageData));
+        return;
+    end
+
+    writableImage = im2uint8(imageData);
+end
+
+function exportMethodReportImage(attempt, methodFolder)
+    stepCount = numel(attempt.Steps);
+    stepRows = max(1, ceil(stepCount / 2));
+    cardWidth = 1400;
+    cardHeight = 240 + stepRows * 340;
+
+    exportFigure = figure( ...
+        'Visible', 'off', ...
+        'Color', [1 1 1], ...
+        'Position', [100 100 cardWidth cardHeight], ...
+        'PaperPositionMode', 'auto', ...
+        'InvertHardcopy', 'off');
+
+    cleanupFigure = onCleanup(@() close(exportFigure));
+
+    notesText = char(string(attempt.Notes));
+    if strlength(string(attempt.Notes)) == 0
+        notesText = 'No additional notes.';
+    end
+
+    annotation(exportFigure, 'textbox', [0.02 0.965 0.96 0.03], ...
+        'String', sprintf('Method %s | Status: %s', upper(char(attempt.Method)), char(attempt.Status)), ...
+        'EdgeColor', 'none', 'FontWeight', 'bold', 'FontSize', 13, ...
+        'Color', [0.10 0.12 0.16], 'Interpreter', 'none');
+    annotation(exportFigure, 'textbox', [0.02 0.935 0.96 0.028], ...
+        'String', notesText, ...
+        'EdgeColor', 'none', 'FontSize', 11, 'Color', [0.36 0.40 0.46], ...
+        'Interpreter', 'none');
+
+    tiled = tiledlayout(exportFigure, stepRows, 2, ...
+        'Padding', 'compact', 'TileSpacing', 'compact');
+
+    for stepIndex = 1:stepCount
+        currentStep = attempt.Steps(stepIndex);
+        ax = nexttile(tiled);
+        axis(ax, 'off', 'image');
+
+        if ~isempty(currentStep.Image)
+            imageData = makeWritableImage(currentStep.Image);
+            imshow(imageData, 'Parent', ax);
+        else
+            text(ax, 0.5, 0.5, sprintf('No debug image available for Step %d', stepIndex), ...
+                'HorizontalAlignment', 'center', 'Units', 'normalized', ...
+                'Color', [0.25 0.25 0.25], 'FontSize', 11);
+        end
+
+        title(ax, char(string(currentStep.Title)), 'Interpreter', 'none', 'FontSize', 11);
+        descText = char(string(currentStep.Description));
+        if strlength(string(currentStep.Description)) == 0
+            descText = 'No description available.';
+        end
+        text(ax, 0.02, 0.02, descText, ...
+            'Units', 'normalized', ...
+            'Interpreter', 'none', ...
+            'FontSize', 9, ...
+            'Color', [0.20 0.20 0.20], ...
+            'BackgroundColor', [1 1 1], ...
+            'Margin', 2, ...
+            'VerticalAlignment', 'bottom', ...
+            'HorizontalAlignment', 'left');
+    end
+
+    drawnow;
+    pause(0.1);
+
+    methodName = upper(char(attempt.Method));
+    reportImagePath = fullfile(methodFolder, sprintf('%s_report.png', methodName));
+    reportPdfPath = fullfile(methodFolder, sprintf('%s_report.pdf', methodName));
+    exportgraphics(exportFigure, reportImagePath, 'Resolution', 200);
+    exportgraphics(exportFigure, reportPdfPath, 'ContentType', 'image');
+end
+
+function writeAttemptFallbackSummary(attempt, methodFolder, exportError)
+    summaryPath = fullfile(methodFolder, 'report_summary.txt');
+    fid = fopen(summaryPath, 'w');
+    if fid == -1
+        return;
+    end
+    cleanupFile = onCleanup(@() fclose(fid));
+
+    fprintf(fid, 'Method: %s\n', upper(char(attempt.Method)));
+    fprintf(fid, 'Status: %s\n', char(string(attempt.Status)));
+    fprintf(fid, 'Notes: %s\n', char(string(attempt.Notes)));
+    if ~isempty(exportError)
+        fprintf(fid, 'Export error: %s\n', exportError.message);
+    end
+    fprintf(fid, '\nSteps:\n');
+
+    for i = 1:numel(attempt.Steps)
+        currentStep = attempt.Steps(i);
+        fprintf(fid, '%d. %s\n', i, char(string(currentStep.Title)));
+        fprintf(fid, '   %s\n', char(string(currentStep.Description)));
+    end
+
+    clear cleanupFile;
 end
