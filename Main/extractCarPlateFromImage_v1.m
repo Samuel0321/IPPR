@@ -726,6 +726,11 @@ function [textValue, score] = readTwoLineDirectOCR(imageData)
     mergedText = postCorrectPlateTextV1(mergedText);
     textValue = mergedText;
     score = scoreDirectOCRText(mergedText, topResult) + scoreDirectOCRText(mergedText, bottomResult) * 0.35;
+    if isLikelyPlateTextV1(mergedText)
+        score = score + 28;
+    elseif isUsablePlateTextV1(mergedText)
+        score = score + 14;
+    end
 end
 
 function textValue = formatDirectOCRText(rawText)
@@ -756,22 +761,22 @@ function score = scoreDirectOCRText(textValue, ocrResult)
     elseif isStrictShortPlateTextV1(textValue)
         score = score + 8;
     end
+    score = score + platePatternScoreV1(textValue);
 end
 
 function result = runOCRWithFallbackV1(ocrInput)
-    try
-        result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 'TextLayout', 'Word');
-        return;
-    catch
-    end
-
     try
         result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
         return;
     catch
     end
 
-    result = ocr(ocrInput);
+    try
+        result = ocr(ocrInput);
+        return;
+    catch
+    end
+    result = [];
 end
 
 function tightenedBox = tightenBoxByCharacterBand(grayImage, initialBox)
@@ -1071,7 +1076,7 @@ function bestText = extractBestPlateSubstring(rawText)
         return;
     end
 
-    candidateMatches = regexp(char(rawText), '[A-Z]\d{1,4}|[A-Z]{1,3}\d{1,4}[A-Z]?|\d{1,4}[A-Z]{1,3}', 'match');
+    candidateMatches = regexp(char(rawText), '\d{2,4}(DC|CC|UN|PA)|Z[A-Z]\d{1,4}|[A-Z]{1,3}\d{1,4}[A-Z]?', 'match');
     if isempty(candidateMatches)
         candidateMatches = {char(rawText)};
     end
@@ -1092,6 +1097,7 @@ function bestText = extractBestPlateSubstring(rawText)
         elseif strlength(candidate) >= 2 && strlength(candidate) <= 4
             score = score + 6;
         end
+        score = score + platePatternScoreV1(candidate);
 
         if score > bestScore
             bestScore = score;
@@ -1109,7 +1115,7 @@ function tf = isLikelyPlateTextV1(textValue)
     textValue = cleanPlateText(textValue);
     if strlength(textValue) >= 4
         tf = ~isempty(regexp(char(textValue), ...
-            '^[A-Z]{1,3}\d{1,4}[A-Z]?$|^[A-Z]{1,2}\d{1,4}[A-Z]{1,3}$', 'once'));
+            '^\d{2,4}(DC|CC|UN|PA)$|^Z[A-Z]\d{1,4}$|^[A-Z]{1,3}\d{1,4}[A-Z]?$', 'once'));
     else
         tf = isStrictShortPlateTextV1(textValue);
     end
@@ -1132,8 +1138,6 @@ function textValue = postCorrectPlateTextV1(textValue)
         strrep(char(textValue), '8', 'B')
         strrep(char(textValue), 'S', '5')
         strrep(char(textValue), '5', 'S')
-        strrep(char(textValue), 'Z', '2')
-        strrep(char(textValue), '2', 'Z')
     }));
 
     bestText = textValue;
@@ -1159,6 +1163,29 @@ function textValue = postCorrectPlateTextV1(textValue)
         end
     end
     textValue = bestText;
+end
+
+function score = platePatternScoreV1(textValue)
+    textValue = cleanPlateText(textValue);
+    score = 0;
+
+    if strlength(textValue) == 0
+        return;
+    end
+
+    if ~isempty(regexp(char(textValue), '^\d{2,4}(DC|CC|UN|PA)$', 'once'))
+        score = score + 42;
+    elseif ~isempty(regexp(char(textValue), '^Z[A-Z]\d{1,4}$', 'once'))
+        score = score + 48;
+    elseif ~isempty(regexp(char(textValue), '^[A-Z]{1,3}\d{1,4}[A-Z]?$' , 'once'))
+        score = score + 30;
+    end
+
+    if ~isempty(regexp(char(textValue), '^[A-Z]\d[A-Z]{2,3}$', 'once'))
+        score = score - 55;
+    elseif ~isempty(regexp(char(textValue), '^[A-Z]{1,2}\d[A-Z]{2,3}$', 'once'))
+        score = score - 40;
+    end
 end
 
 function imageData = loadVehicleImage(imagePath)

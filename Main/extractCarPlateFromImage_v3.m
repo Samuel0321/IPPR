@@ -549,18 +549,18 @@ end
 
 function result = runOCRWithFallbackV3(ocrInput)
     try
-        result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 'TextLayout', 'Word');
-        return;
-    catch
-    end
-
-    try
         result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
         return;
     catch
     end
 
-    result = ocr(ocrInput);
+    try
+        result = ocr(ocrInput);
+        return;
+    catch
+    end
+
+    result = [];
 end
 
 function tf = isUsablePlateTextV3(textValue)

@@ -382,9 +382,9 @@ function [score, cropImage, binaryImage, textValue] = ...
     end
 
     if preferFullBox
-        score = score + 28;
+        score = score + 42;
     else
-        score = score - 20;
+        score = score - 28;
     end
 
     score = score + foregroundCoverageScoreV2(binaryImage);
@@ -535,6 +535,11 @@ function [textValue, score] = twoLineOCRV2(imageData)
     textValue = normalizeOCRTextV2(cleanPlateTextV2(topResult.Text) + cleanPlateTextV2(bottomResult.Text));
     textValue = postCorrectPlateTextV2(textValue);
     score = scoreOCRTextV2(textValue, topResult) + scoreOCRTextV2(textValue, bottomResult) * 0.35;
+    if isLikelyPlateTextV2(textValue)
+        score = score + 28;
+    elseif isUsablePlateTextV2(textValue)
+        score = score + 14;
+    end
 end
 
 function score = structureScoreV2(grayCrop, binaryImage, candidateBox, imageSize)
@@ -946,22 +951,22 @@ function score = scoreOCRTextV2(textValue, ocrResult)
     if isUsablePlateTextV2(textValue)
         score = score + 12;
     end
+    score = score + platePatternScoreV2(textValue);
 end
 
 function result = runOCRWithFallbackV2(ocrInput)
-    try
-        result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 'TextLayout', 'Word');
-        return;
-    catch
-    end
-
     try
         result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
         return;
     catch
     end
 
-    result = ocr(ocrInput);
+    try
+        result = ocr(ocrInput);
+        return;
+    catch
+    end
+    result = [];
 end
 
 function textValue = postCorrectPlateTextV2(textValue)
@@ -980,8 +985,6 @@ function textValue = postCorrectPlateTextV2(textValue)
         strrep(char(textValue), '8', 'B')
         strrep(char(textValue), 'S', '5')
         strrep(char(textValue), '5', 'S')
-        strrep(char(textValue), 'Z', '2')
-        strrep(char(textValue), '2', 'Z')
     }));
 
     bestText = textValue;
@@ -1104,7 +1107,7 @@ function bestText = extractBestSubstringV2(rawText)
         return;
     end
 
-    matches = regexp(char(bestText), '[A-Z]\d{1,4}|[A-Z]{1,3}\d{1,4}[A-Z]?|\d{1,4}[A-Z]{1,3}', 'match');
+    matches = regexp(char(bestText), '\d{2,4}(DC|CC|UN|PA)|Z[A-Z]\d{1,4}|[A-Z]{1,3}\d{1,4}[A-Z]?', 'match');
     if isempty(matches)
         matches = {char(bestText)};
     end
@@ -1125,6 +1128,7 @@ function bestText = extractBestSubstringV2(rawText)
         elseif strlength(candidate) >= 2 && strlength(candidate) <= 4
             score = score + 6;
         end
+        score = score + platePatternScoreV2(candidate);
         if score > bestScore
             bestScore = score;
             bestText = candidate;
@@ -1136,9 +1140,32 @@ function tf = isLikelyPlateTextV2(textValue)
     textValue = cleanPlateTextV2(textValue);
     if strlength(textValue) >= 4
         tf = ~isempty(regexp(char(textValue), ...
-            '^[A-Z]{1,3}\d{1,4}[A-Z]?$|^[A-Z]{1,2}\d{1,4}[A-Z]{1,3}$', 'once'));
+            '^\d{2,4}(DC|CC|UN|PA)$|^Z[A-Z]\d{1,4}$|^[A-Z]{1,3}\d{1,4}[A-Z]?$', 'once'));
     else
         tf = isStrictShortPlateTextV2(textValue);
+    end
+end
+
+function score = platePatternScoreV2(textValue)
+    textValue = cleanPlateTextV2(textValue);
+    score = 0;
+
+    if strlength(textValue) == 0
+        return;
+    end
+
+    if ~isempty(regexp(char(textValue), '^\d{2,4}(DC|CC|UN|PA)$', 'once'))
+        score = score + 42;
+    elseif ~isempty(regexp(char(textValue), '^Z[A-Z]\d{1,4}$', 'once'))
+        score = score + 48;
+    elseif ~isempty(regexp(char(textValue), '^[A-Z]{1,3}\d{1,4}[A-Z]?$', 'once'))
+        score = score + 30;
+    end
+
+    if ~isempty(regexp(char(textValue), '^[A-Z]\d[A-Z]{2,3}$', 'once'))
+        score = score - 55;
+    elseif ~isempty(regexp(char(textValue), '^[A-Z]{1,2}\d[A-Z]{2,3}$', 'once'))
+        score = score - 40;
     end
 end
 

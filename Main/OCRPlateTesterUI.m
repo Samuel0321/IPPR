@@ -430,7 +430,7 @@ function [variantImages, variantNames, variantTexts, bestIndex] = runVariantOCR(
             ocrInput = currentImage;
         end
 
-        result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 'TextLayout', 'Word');
+        result = ocr(ocrInput, 'CharacterSet', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
         currentText = formatOCRText(result.Text);
         variantTexts(i) = currentText;
         variantScores(i) = scoreOCRText(currentText, result);
