@@ -116,10 +116,6 @@ function score = fallbackResultScore(result)
     end
 end
 
-function tf = isValidPlateText(textValue)
-    tf = isAcceptableFinalPlateText(textValue);
-end
-
 function tf = isAcceptableFinalResult(result)
     if ~isAcceptableFinalPlateText(result.PlateText)
         tf = false;

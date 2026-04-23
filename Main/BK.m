@@ -890,12 +890,6 @@ function folderPath = getDefaultDownloadsFolder()
     folderPath = pwd;
 end
 
-function safeName = sanitizeFileName(fileName)
-    safeName = regexprep(string(fileName), '[^A-Za-z0-9_-]', '_');
-    safeName = regexprep(safeName, '_+', '_');
-    safeName = char(safeName);
-end
-
 function writableImage = makeWritableImage(imageData)
     if islogical(imageData)
         writableImage = uint8(imageData) * 255;
