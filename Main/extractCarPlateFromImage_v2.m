@@ -420,6 +420,13 @@ function variantImages = runCandidateOCRV2(cropImage)
     grayImage = im2uint8(grayImage);
     enhanced = adapthisteq(grayImage, 'NumTiles', [8 8], 'ClipLimit', 0.02);
     sharpened = imsharpen(enhanced, 'Radius', 1.0, 'Amount', 1.1);
+    contrastBoost = imadjust(grayImage, stretchlim(grayImage, [0.01 0.995]), []);
+    gammaBright = imadjust(enhanced, [], [], 0.85);
+    gammaDark = imadjust(enhanced, [], [], 1.20);
+    trimmedGray = trimPlateBorderForOCRV2(grayImage);
+    trimmedSharp = trimPlateBorderForOCRV2(sharpened);
+    paddedGray = padPlateCropForOCRV2(grayImage);
+    paddedSharp = padPlateCropForOCRV2(sharpened);
     upscaledGray2 = imresize(grayImage, 2.0, 'bicubic');
     upscaledSharp2 = imresize(sharpened, 2.0, 'bicubic');
     upscaledGray3 = imresize(grayImage, 3.0, 'bicubic');
@@ -442,6 +449,13 @@ function variantImages = runCandidateOCRV2(cropImage)
         grayImage
         enhanced
         sharpened
+        contrastBoost
+        gammaBright
+        gammaDark
+        trimmedGray
+        trimmedSharp
+        paddedGray
+        paddedSharp
         darkText
         brightText
         invertedImage
@@ -499,6 +513,20 @@ function [bestText, bestScore] = readOCRVariantV2(ocrInput)
         textValue = postCorrectPlateTextV2(normalizeOCRTextV2(result.Text));
         candidates(end + 1, 1) = textValue; %#ok<AGROW>
         scores(end + 1, 1) = scoreOCRTextV2(textValue, result); %#ok<AGROW>
+
+        militaryCandidates = generateMilitaryRecoveryCandidatesV2(textValue, ocrInput);
+        for variantIndex = 1:numel(militaryCandidates)
+            variantText = militaryCandidates(variantIndex);
+            candidates(end + 1, 1) = variantText; %#ok<AGROW>
+            scores(end + 1, 1) = scoreOCRTextV2(variantText, result) + 18; %#ok<AGROW>
+        end
+
+        digitDisambig = generateMilitaryDigitReOCRCandidatesV2(textValue, ocrInput);
+        for variantIndex = 1:numel(digitDisambig)
+            variantText = digitDisambig(variantIndex);
+            candidates(end + 1, 1) = variantText; %#ok<AGROW>
+            scores(end + 1, 1) = scoreOCRTextV2(variantText, result) + 22; %#ok<AGROW>
+        end
     catch err
         warning('PlateOCR:v2VariantOCR', 'v2 OCR variant failed: %s', err.message);
     end
@@ -509,6 +537,18 @@ function [bestText, bestScore] = readOCRVariantV2(ocrInput)
         lineText = postCorrectPlateTextV2(lineText);
         candidates(end + 1, 1) = lineText; %#ok<AGROW>
         scores(end + 1, 1) = lineScore; %#ok<AGROW>
+        militaryCandidates = generateMilitaryRecoveryCandidatesV2(lineText, ocrInput);
+        for variantIndex = 1:numel(militaryCandidates)
+            variantText = militaryCandidates(variantIndex);
+            candidates(end + 1, 1) = variantText; %#ok<AGROW>
+            scores(end + 1, 1) = lineScore + platePatternScoreV2(variantText) + 18; %#ok<AGROW>
+        end
+        digitDisambig = generateMilitaryDigitReOCRCandidatesV2(lineText, ocrInput);
+        for variantIndex = 1:numel(digitDisambig)
+            variantText = digitDisambig(variantIndex);
+            candidates(end + 1, 1) = variantText; %#ok<AGROW>
+            scores(end + 1, 1) = lineScore + platePatternScoreV2(variantText) + 22; %#ok<AGROW>
+        end
         catch err
             warning('PlateOCR:v2TwoLineOCR', 'v2 two-line OCR failed: %s', err.message);
         end
@@ -927,6 +967,236 @@ function cleanedText = cleanPlateTextV2(rawText)
     cleanedText = regexprep(cleanedText, '[^A-Z0-9]', '');
 end
 
+function trimmedImage = trimPlateBorderForOCRV2(imageData)
+    trimmedImage = imageData;
+    if isempty(imageData)
+        return;
+    end
+
+    trimY = max(1, round(size(imageData, 1) * 0.05));
+    trimX = max(1, round(size(imageData, 2) * 0.04));
+    if size(imageData, 1) > 2 * trimY && size(imageData, 2) > 2 * trimX
+        trimmedImage = imageData((1 + trimY):(end - trimY), (1 + trimX):(end - trimX), :);
+    end
+end
+
+function paddedImage = padPlateCropForOCRV2(imageData)
+    paddedImage = imageData;
+    if isempty(imageData)
+        return;
+    end
+
+    imageData = im2uint8(imageData);
+    padY = max(2, round(size(imageData, 1) * 0.08));
+    padLeft = max(3, round(size(imageData, 2) * 0.10));
+    padRight = max(2, round(size(imageData, 2) * 0.06));
+    fillValue = median(imageData(:));
+    paddedImage = padarray(imageData, [padY padLeft], fillValue, 'both');
+    if padRight > padLeft
+        paddedImage = padarray(paddedImage, [0 padRight - padLeft], fillValue, 'post');
+    end
+end
+
+function candidates = generateMilitaryRecoveryCandidatesV2(textValue, ocrInput)
+    cleanedText = cleanPlateTextV2(textValue);
+    candidates = strings(0, 1);
+    if strlength(cleanedText) == 0
+        return;
+    end
+
+    [leftEdgeScore, componentCount] = militaryEdgeEvidenceV2(ocrInput);
+
+    if ~isempty(regexp(char(cleanedText), '^[A-Z]\d{3,4}$', 'once')) && ...
+            componentCount >= strlength(cleanedText) + 1 && leftEdgeScore >= 0.18
+        candidates(end + 1, 1) = "Z" + cleanedText; %#ok<AGROW>
+    end
+
+    if ~isempty(regexp(char(cleanedText), '^[27TI][A-Z]\d{3,4}$', 'once')) && leftEdgeScore >= 0.12
+        candidates(end + 1, 1) = "Z" + extractAfter(cleanedText, 1); %#ok<AGROW>
+    end
+
+    candidates = unique(candidates);
+end
+
+function [leftEdgeScore, componentCount] = militaryEdgeEvidenceV2(ocrInput)
+    binaryMask = buildMilitaryEvidenceMaskV2(ocrInput);
+    componentCount = countCharComponentsV2(binaryMask);
+    leftColumns = max(1, round(size(binaryMask, 2) * 0.18));
+    leftBand = binaryMask(:, 1:leftColumns);
+    leftEdgeScore = nnz(leftBand) / max(numel(leftBand), 1);
+end
+
+function candidates = generateMilitaryDigitReOCRCandidatesV2(textValue, ocrInput)
+    candidates = strings(0, 1);
+    cleanedText = cleanPlateTextV2(textValue);
+    if isempty(regexp(char(cleanedText), '^Z[A-Z]\d{2,4}$', 'once'))
+        return;
+    end
+    if isempty(ocrInput) || size(ocrInput, 2) < 40 || size(ocrInput, 1) < 12
+        return;
+    end
+
+    digitChars = char(extractAfter(cleanedText, 2));
+    expectedDigits = numel(digitChars);
+
+    digitBoxes = locateMilitaryDigitBoxesV2(ocrInput, expectedDigits);
+    if isempty(digitBoxes)
+        return;
+    end
+
+    grayInput = im2uint8(ocrInput);
+    if ndims(grayInput) == 3
+        grayInput = rgb2gray(grayInput);
+    end
+
+    perDigitText = repmat(' ', 1, expectedDigits);
+    for k = 1:expectedDigits
+        digitImage = cropPaddedDigitV2(grayInput, digitBoxes(k, :));
+        if isempty(digitImage)
+            return;
+        end
+        digitChar = readSingleDigitV2(digitImage);
+        if isempty(digitChar)
+            return;
+        end
+        perDigitText(k) = digitChar;
+    end
+
+    if any(perDigitText == ' ') || ~all(isstrprop(perDigitText, 'digit'))
+        return;
+    end
+
+    rebuilt = string(extractBefore(cleanedText, 3)) + string(perDigitText);
+    if rebuilt ~= string(cleanedText)
+        candidates(end + 1, 1) = rebuilt;
+    end
+end
+
+function digitBoxes = locateMilitaryDigitBoxesV2(ocrInput, expectedDigits)
+    digitBoxes = [];
+    binaryMask = buildMilitaryEvidenceMaskV2(ocrInput);
+    if ~any(binaryMask(:))
+        return;
+    end
+
+    [rows, cols] = size(binaryMask);
+    stats = regionprops(binaryMask, 'BoundingBox', 'Area');
+    if isempty(stats)
+        return;
+    end
+
+    boxes = reshape([stats.BoundingBox], 4, []).';
+    areas = [stats.Area]';
+    widths = boxes(:, 3);
+    heights = boxes(:, 4);
+    aspect = widths ./ max(heights, 1);
+
+    keep = areas >= 18 & ...
+        heights >= rows * 0.28 & heights <= rows * 0.95 & ...
+        widths >= 2 & widths <= cols * 0.45 & ...
+        aspect >= 0.08 & aspect <= 1.4;
+    boxes = boxes(keep, :);
+
+    if size(boxes, 1) < expectedDigits
+        return;
+    end
+
+    [~, order] = sort(boxes(:, 1));
+    boxes = boxes(order, :);
+
+    digitOnly = boxes(boxes(:, 1) >= cols * 0.18, :);
+    if size(digitOnly, 1) < expectedDigits
+        digitOnly = boxes(end - expectedDigits + 1:end, :);
+    elseif size(digitOnly, 1) > expectedDigits
+        digitOnly = digitOnly(end - expectedDigits + 1:end, :);
+    end
+
+    if size(digitOnly, 1) ~= expectedDigits
+        return;
+    end
+
+    digitBoxes = digitOnly;
+end
+
+function digitImage = cropPaddedDigitV2(grayInput, bbox)
+    digitImage = [];
+    if isempty(bbox)
+        return;
+    end
+    [rows, cols] = size(grayInput);
+    padX = max(2, round(bbox(3) * 0.30));
+    padY = max(2, round(bbox(4) * 0.20));
+    x1 = max(1, floor(bbox(1) - padX));
+    y1 = max(1, floor(bbox(2) - padY));
+    x2 = min(cols, ceil(bbox(1) + bbox(3) + padX));
+    y2 = min(rows, ceil(bbox(2) + bbox(4) + padY));
+    if x2 <= x1 || y2 <= y1
+        return;
+    end
+    digitImage = grayInput(y1:y2, x1:x2);
+end
+
+function digitChar = readSingleDigitV2(digitImage)
+    digitChar = '';
+    if isempty(digitImage)
+        return;
+    end
+
+    upscaled = imresize(digitImage, 5.0, 'bicubic');
+    upscaled = im2uint8(upscaled);
+    sharpened = imsharpen(upscaled, 'Radius', 1.0, 'Amount', 1.4);
+    enhanced = adapthisteq(upscaled, 'NumTiles', [4 4], 'ClipLimit', 0.02);
+    fillValue = median(upscaled(:));
+    paddedSharp = padarray(sharpened, [10 10], fillValue, 'both');
+    paddedEnh = padarray(enhanced, [10 10], fillValue, 'both');
+
+    candidates = {paddedSharp, paddedEnh, sharpened};
+    layouts = {'Character', 'Word', 'Block'};
+
+    bestChar = '';
+    bestConfidence = -inf;
+    for variantIdx = 1:numel(candidates)
+        ocrInput = candidates{variantIdx};
+        for layoutIdx = 1:numel(layouts)
+            try
+                ocrResult = ocr(ocrInput, ...
+                    'CharacterSet', '0123456789', ...
+                    'TextLayout', layouts{layoutIdx});
+            catch
+                continue;
+            end
+            cleaned = regexprep(upper(string(ocrResult.Text)), '[^0-9]', '');
+            if strlength(cleaned) == 0
+                continue;
+            end
+            firstChar = char(extractBefore(cleaned + " ", 2));
+            if ~isempty(ocrResult.CharacterConfidences)
+                confidence = mean(ocrResult.CharacterConfidences, 'omitnan');
+            else
+                confidence = 0;
+            end
+            if confidence > bestConfidence
+                bestConfidence = confidence;
+                bestChar = firstChar;
+            end
+        end
+    end
+
+    digitChar = bestChar;
+end
+
+function binaryMask = buildMilitaryEvidenceMaskV2(ocrInput)
+    if islogical(ocrInput)
+        binaryMask = ocrInput;
+    else
+        grayInput = im2uint8(ocrInput);
+        darkMask = imbinarize(grayInput, 'adaptive', 'ForegroundPolarity', 'dark', 'Sensitivity', 0.42);
+        brightMask = imbinarize(grayInput, 'adaptive', 'ForegroundPolarity', 'bright', 'Sensitivity', 0.48);
+        binaryMask = darkMask | brightMask;
+    end
+    binaryMask = cleanBinaryV2(binaryMask);
+end
+
 function score = scoreOCRTextV2(textValue, ocrResult)
     score = strlength(textValue) * 10;
     if ~isempty(ocrResult.CharacterConfidences)
@@ -1157,7 +1427,7 @@ function score = platePatternScoreV2(textValue)
     if ~isempty(regexp(char(textValue), '^\d{2,4}(DC|CC|UN|PA)$', 'once'))
         score = score + 42;
     elseif ~isempty(regexp(char(textValue), '^Z[A-Z]\d{1,4}$', 'once'))
-        score = score + 48;
+        score = score + 68;
     elseif ~isempty(regexp(char(textValue), '^[A-Z]{1,3}\d{1,4}[A-Z]?$', 'once'))
         score = score + 30;
     end

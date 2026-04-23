@@ -882,6 +882,7 @@ function classification = classifyMalaysianPlateReadV4(textValue)
     cleanedText = sanitizeOCRTextV4(textValue);
     classification = struct( ...
         'IsStrongValid', false, ...
+        'IsMilitary', false, ...
         'IsPlausiblePartial', false, ...
         'IsReject', false, ...
         'CleanedText', cleanedText);
@@ -895,6 +896,13 @@ function classification = classifyMalaysianPlateReadV4(textValue)
     shortPattern = '^[A-Z]\d{1,4}$';
     stackedPattern = '^[A-Z]{1,4}\d{1,4}$';
     mixedPattern = '^[A-Z]{1,2}\d{1,4}[A-Z]{1,3}$';
+    militaryPattern = '^Z[A-Z]\d{1,4}$';
+
+    if ~isempty(regexp(char(cleanedText), militaryPattern, 'once'))
+        classification.IsStrongValid = true;
+        classification.IsMilitary = true;
+        return;
+    end
 
     if ~isempty(regexp(char(cleanedText), standardPattern, 'once')) || ...
             ~isempty(regexp(char(cleanedText), shortPattern, 'once')) || ...
@@ -917,6 +925,10 @@ function classification = classifyMalaysianPlateReadV4(textValue)
 end
 
 function score = classificationScoreV4(classification)
+    if isfield(classification, 'IsMilitary') && classification.IsMilitary
+        score = 150;
+        return;
+    end
     if classification.IsStrongValid
         score = 120;
         return;

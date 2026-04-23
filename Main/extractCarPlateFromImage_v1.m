@@ -1176,7 +1176,7 @@ function score = platePatternScoreV1(textValue)
     if ~isempty(regexp(char(textValue), '^\d{2,4}(DC|CC|UN|PA)$', 'once'))
         score = score + 42;
     elseif ~isempty(regexp(char(textValue), '^Z[A-Z]\d{1,4}$', 'once'))
-        score = score + 48;
+        score = score + 68;
     elseif ~isempty(regexp(char(textValue), '^[A-Z]{1,3}\d{1,4}[A-Z]?$' , 'once'))
         score = score + 30;
     end
